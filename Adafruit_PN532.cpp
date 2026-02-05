@@ -1818,3 +1818,47 @@ void Adafruit_PN532::writecommand(uint8_t *cmd, uint8_t cmdlen) {
     }
   }
 }
+
+bool Adafruit_PN532::ul_pwd_auth(const uint8_t pwd[4], uint8_t pack_out[2], uint16_t timeout) {
+  // On utilise InCommunicateThru (0x42) au lieu de InDataExchange (0x40)
+  // Reponse attendue: ... D5 43 00 PACK0 PACK1 ...
+  pn532_packetbuffer[0] = PN532_COMMAND_INCOMMUNICATETHRU; // 0x42
+  pn532_packetbuffer[1] = 0x1B; // PWD_AUTH
+  memcpy(pn532_packetbuffer + 2, pwd, 4);
+
+  if (!sendCommandCheckAck(pn532_packetbuffer, 6, timeout)) {
+    return false;
+  }
+
+  // Success typique: 00 00 FF 05 FB D5 43 00 PACK0 PACK1 DCS 00 (12 bytes) :cite[bfd]
+  // Wrong PWD typique: 00 00 FF 03 FD D5 43 01 DCS 00 (10 bytes) :cite[bfd]
+  readdata(pn532_packetbuffer, 20); // on lit "large", le surplus sera 0x00 en SPI
+
+  // Vérif preamble
+  if (!(pn532_packetbuffer[0] == 0x00 && pn532_packetbuffer[1] == 0x00 && pn532_packetbuffer[2] == 0xFF)) {
+    return false;
+  }
+
+  uint8_t len = pn532_packetbuffer[3];
+  if (pn532_packetbuffer[4] != (uint8_t)(~len + 1)) {
+    return false;
+  }
+
+  if (pn532_packetbuffer[5] != PN532_PN532TOHOST) { // 0xD5
+    return false;
+  }
+
+  if (pn532_packetbuffer[6] != (PN532_COMMAND_INCOMMUNICATETHRU + 1)) { // 0x43
+    return false;
+  }
+
+  uint8_t status = pn532_packetbuffer[7];
+  if (status != 0x00) {
+    return false;
+  }
+
+  // PACK sur 2 octets
+  pack_out[0] = pn532_packetbuffer[8];
+  pack_out[1] = pn532_packetbuffer[9];
+  return true;
+}

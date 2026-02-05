@@ -199,6 +199,8 @@ public:
   static void PrintHex(const byte *data, const uint32_t numBytes);
   static void PrintHexChar(const byte *pbtData, const uint32_t numBytes);
 
+  bool ul_pwd_auth(const uint8_t pwd[4], uint8_t pack_out[2], uint16_t timeout = 1000);
+
 private:
   int8_t _irq = -1, _reset = -1, _cs = -1;
   int8_t _uid[7];      // ISO14443A uid
