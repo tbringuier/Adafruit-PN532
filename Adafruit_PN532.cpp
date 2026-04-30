@@ -1281,6 +1281,77 @@ uint8_t Adafruit_PN532::mifareultralight_WritePage(uint8_t page,
   return 1;
 }
 
+/**************************************************************************/
+/*!
+    @brief   Performs a PWD_AUTH (0x1B) password authentication against a
+             Mifare Ultralight EV1 / NTAG21x tag.
+
+    Unlike Mifare Classic auth, PWD_AUTH is a raw NFC Forum Type 2 command
+    that the PN532's InDataExchange (0x40) wrapper does not handle cleanly:
+    on success the tag returns a 2-byte PACK (no ISO14443A status byte),
+    and on failure it returns a 4-bit NAK. We therefore dispatch the
+    command via InCommunicateThru (0x42), which is a raw passthrough and
+    is the path recommended by NXP for this command on the PN532.
+
+    Expected response frames:
+      - Success : 00 00 FF 05 FB D5 43 00 PACK0 PACK1 DCS 00
+      - Wrong   : 00 00 FF 03 FD D5 43 01 DCS 00   (status byte != 0x00)
+
+    The 2-byte PACK is returned via @p pack_out so the caller can verify
+    the tag's authenticity in addition to the authentication status.
+
+    @param   pwd       4-byte password (matches the tag's PWD page).
+    @param   pack_out  2-byte buffer that receives the PACK on success.
+    @param   timeout   Command timeout in milliseconds (default 1000).
+    @return  true on successful authentication, false otherwise.
+*/
+/**************************************************************************/
+bool Adafruit_PN532::mifareultralightev1_PwdAuth(const uint8_t pwd[4],
+                                                 uint8_t pack_out[2],
+                                                 uint16_t timeout) {
+  pn532_packetbuffer[0] = PN532_COMMAND_INCOMMUNICATETHRU;
+  pn532_packetbuffer[1] = MIFARE_ULTRALIGHTEV1_CMD_PWD_AUTH;
+  memcpy(pn532_packetbuffer + 2, pwd, 4);
+
+  if (!sendCommandCheckAck(pn532_packetbuffer, 6, timeout)) {
+#ifdef MIFAREDEBUG
+    PN532DEBUGPRINT.println(F("Failed to receive ACK for PWD_AUTH"));
+#endif
+    return false;
+  }
+
+  // Read generously: trailing bytes are 0x00 over SPI/I2C.
+  readdata(pn532_packetbuffer, 20);
+
+  // Validate preamble + start code: 00 00 FF
+  if (pn532_packetbuffer[0] != 0x00 || pn532_packetbuffer[1] != 0x00 ||
+      pn532_packetbuffer[2] != 0xFF) {
+    return false;
+  }
+
+  // Validate length checksum: LEN + LCS == 0
+  uint8_t len = pn532_packetbuffer[3];
+  if (pn532_packetbuffer[4] != (uint8_t)(~len + 1)) {
+    return false;
+  }
+
+  // Validate TFI (PN532 -> Host) and response opcode (cmd + 1)
+  if (pn532_packetbuffer[5] != PN532_PN532TOHOST ||
+      pn532_packetbuffer[6] != (PN532_COMMAND_INCOMMUNICATETHRU + 1)) {
+    return false;
+  }
+
+  // PN532 status byte: 0x00 means the underlying card command succeeded.
+  // A wrong password produces a NAK from the tag, surfaced here as != 0x00.
+  if (pn532_packetbuffer[7] != 0x00) {
+    return false;
+  }
+
+  pack_out[0] = pn532_packetbuffer[8];
+  pack_out[1] = pn532_packetbuffer[9];
+  return true;
+}
+
 /***** NTAG2xx Functions ******/
 
 /**************************************************************************/
