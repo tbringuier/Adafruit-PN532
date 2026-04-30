@@ -90,6 +90,16 @@
 #define MIFARE_ULTRALIGHT_CMD_WRITE (0xA2) ///< Write (MiFare Ultralight)
 #define MIFARE_ULTRALIGHTEV1_CMD_PWD_AUTH                                      \
   (0x1B) ///< Password authentication (MiFare Ultralight EV1, NTAG21x)
+#define MIFARE_ULTRALIGHTEV1_CMD_GET_VERSION                                   \
+  (0x60) ///< Returns vendor/type/storage info (MiFare Ultralight EV1, NTAG21x)
+#define MIFARE_ULTRALIGHTEV1_CMD_READ_SIG                                      \
+  (0x3C) ///< Read 32-byte ECC originality signature (NXP anti-clone)
+#define MIFARE_ULTRALIGHTEV1_CMD_READ_CNT                                      \
+  (0x39) ///< Read a 24-bit one-way NFC counter
+#define MIFARE_ULTRALIGHTEV1_CMD_INCR_CNT                                      \
+  (0xA5) ///< Increment a 24-bit one-way NFC counter
+#define MIFARE_ULTRALIGHTEV1_CMD_CHECK_TEARING_EVENT                           \
+  (0x3E) ///< Check whether a counter saw a tearing event
 
 // Prefixes for NDEF Records (to identify record type)
 #define NDEF_URIPREFIX_NONE (0x00)         ///< No prefix
@@ -192,6 +202,19 @@ public:
   uint8_t mifareultralight_WritePage(uint8_t page, uint8_t *data);
   bool mifareultralightev1_PwdAuth(const uint8_t pwd[4], uint8_t pack_out[2],
                                    uint16_t timeout = 1000);
+  bool mifareultralightev1_GetVersion(uint8_t version[8],
+                                      uint16_t timeout = 1000);
+  bool mifareultralightev1_ReadSignature(uint8_t signature[32],
+                                         uint16_t timeout = 1000);
+  bool mifareultralightev1_ReadCounter(uint8_t counter_num,
+                                       uint8_t counter_out[3],
+                                       uint16_t timeout = 1000);
+  bool mifareultralightev1_IncrementCounter(uint8_t counter_num,
+                                            const uint8_t increment[3],
+                                            uint16_t timeout = 1000);
+  bool mifareultralightev1_CheckTearingEvent(uint8_t counter_num,
+                                             uint8_t *flag_out,
+                                             uint16_t timeout = 1000);
 
   // NTAG2xx functions
   uint8_t ntag2xx_ReadPage(uint8_t page, uint8_t *buffer);
@@ -204,6 +227,12 @@ public:
   static void PrintHexChar(const byte *pbtData, const uint32_t numBytes);
 
 private:
+  // Send a raw NFC Forum Type 2 command (the 1-byte cmd + its arguments) to
+  // the currently-selected card via InCommunicateThru, validate the PN532
+  // response frame, and copy the card's data payload into resp_out.
+  bool _ev1RawCommand(const uint8_t *card_cmd, uint8_t cmd_len,
+                      uint8_t *resp_out, uint8_t resp_len, uint16_t timeout);
+
   int8_t _irq = -1, _reset = -1, _cs = -1;
   int8_t _uid[7];      // ISO14443A uid
   int8_t _uidLen;      // uid len

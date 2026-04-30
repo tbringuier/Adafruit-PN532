@@ -1283,73 +1283,237 @@ uint8_t Adafruit_PN532::mifareultralight_WritePage(uint8_t page,
 
 /**************************************************************************/
 /*!
-    @brief   Performs a PWD_AUTH (0x1B) password authentication against a
-             Mifare Ultralight EV1 / NTAG21x tag.
+    @brief   Send a raw NFC Forum Type 2 command to the currently-selected
+             card via InCommunicateThru (0x42), validate the PN532 response
+             frame, and copy the card's data payload into @p resp_out.
 
-    Unlike Mifare Classic auth, PWD_AUTH is a raw NFC Forum Type 2 command
-    that the PN532's InDataExchange (0x40) wrapper does not handle cleanly:
-    on success the tag returns a 2-byte PACK (no ISO14443A status byte),
-    and on failure it returns a 4-bit NAK. We therefore dispatch the
-    command via InCommunicateThru (0x42), which is a raw passthrough and
-    is the path recommended by NXP for this command on the PN532.
+    The PN532's InDataExchange (0x40) wrapper imposes ISO14443A error
+    handling on the response and does not cope with EV1-specific replies
+    (2-byte PACK on PWD_AUTH, 4-bit ACK/NAK on INCR_CNT, 32-byte signature
+    on READ_SIG, …). InCommunicateThru is a raw passthrough and is the
+    path recommended by NXP for these commands on the PN532.
 
-    Expected response frames:
-      - Success : 00 00 FF 05 FB D5 43 00 PACK0 PACK1 DCS 00
-      - Wrong   : 00 00 FF 03 FD D5 43 01 DCS 00   (status byte != 0x00)
+    The expected PN532 response frame layout is:
+        00 00 FF LEN LCS D5 43 STATUS [DATA…] DCS 00
+    with LEN = 3 + DATA_LEN. STATUS == 0x00 means the underlying card
+    command succeeded; any non-zero value (e.g. NAK from the tag on a
+    wrong password) is reported as a failure.
 
-    The 2-byte PACK is returned via @p pack_out so the caller can verify
-    the tag's authenticity in addition to the authentication status.
-
-    @param   pwd       4-byte password (matches the tag's PWD page).
-    @param   pack_out  2-byte buffer that receives the PACK on success.
-    @param   timeout   Command timeout in milliseconds (default 1000).
-    @return  true on successful authentication, false otherwise.
+    @param   card_cmd   Raw card command bytes (cmd opcode + arguments).
+    @param   cmd_len    Length of @p card_cmd in bytes.
+    @param   resp_out   Buffer that receives the card's data payload
+                        (may be NULL if @p resp_len is 0).
+    @param   resp_len   Expected card data payload length in bytes.
+    @param   timeout    Command timeout in milliseconds.
+    @return  true if the frame is well-formed and the card payload size
+             matches @p resp_len, false otherwise.
 */
 /**************************************************************************/
-bool Adafruit_PN532::mifareultralightev1_PwdAuth(const uint8_t pwd[4],
-                                                 uint8_t pack_out[2],
-                                                 uint16_t timeout) {
-  pn532_packetbuffer[0] = PN532_COMMAND_INCOMMUNICATETHRU;
-  pn532_packetbuffer[1] = MIFARE_ULTRALIGHTEV1_CMD_PWD_AUTH;
-  memcpy(pn532_packetbuffer + 2, pwd, 4);
+bool Adafruit_PN532::_ev1RawCommand(const uint8_t *card_cmd, uint8_t cmd_len,
+                                    uint8_t *resp_out, uint8_t resp_len,
+                                    uint16_t timeout) {
+  if ((uint16_t)cmd_len + 1 > PN532_PACKBUFFSIZ) {
+    return false;
+  }
 
-  if (!sendCommandCheckAck(pn532_packetbuffer, 6, timeout)) {
+  pn532_packetbuffer[0] = PN532_COMMAND_INCOMMUNICATETHRU;
+  memcpy(pn532_packetbuffer + 1, card_cmd, cmd_len);
+
+  if (!sendCommandCheckAck(pn532_packetbuffer, cmd_len + 1, timeout)) {
 #ifdef MIFAREDEBUG
-    PN532DEBUGPRINT.println(F("Failed to receive ACK for PWD_AUTH"));
+    PN532DEBUGPRINT.println(F("Failed to receive ACK for InCommunicateThru"));
 #endif
     return false;
   }
 
-  // Read generously: trailing bytes are 0x00 over SPI/I2C.
-  readdata(pn532_packetbuffer, 20);
+  // Frame size = 10 fixed bytes (preamble + start + LEN + LCS + TFI +
+  // resp_cmd + status + DCS + postamble) + DATA_LEN. Read a small margin.
+  uint16_t frame_len = (uint16_t)resp_len + 12;
+  if (frame_len > PN532_PACKBUFFSIZ) {
+    frame_len = PN532_PACKBUFFSIZ;
+  }
+  readdata(pn532_packetbuffer, (uint8_t)frame_len);
 
-  // Validate preamble + start code: 00 00 FF
+  // Preamble + start code: 00 00 FF
   if (pn532_packetbuffer[0] != 0x00 || pn532_packetbuffer[1] != 0x00 ||
       pn532_packetbuffer[2] != 0xFF) {
     return false;
   }
 
-  // Validate length checksum: LEN + LCS == 0
+  // Length checksum: LEN + LCS == 0 (mod 256)
   uint8_t len = pn532_packetbuffer[3];
   if (pn532_packetbuffer[4] != (uint8_t)(~len + 1)) {
     return false;
   }
 
-  // Validate TFI (PN532 -> Host) and response opcode (cmd + 1)
+  // TFI (PN532 -> host) and response opcode (cmd + 1)
   if (pn532_packetbuffer[5] != PN532_PN532TOHOST ||
       pn532_packetbuffer[6] != (PN532_COMMAND_INCOMMUNICATETHRU + 1)) {
     return false;
   }
 
-  // PN532 status byte: 0x00 means the underlying card command succeeded.
-  // A wrong password produces a NAK from the tag, surfaced here as != 0x00.
+  // PN532 status byte (0x00 = card command succeeded)
   if (pn532_packetbuffer[7] != 0x00) {
     return false;
   }
 
-  pack_out[0] = pn532_packetbuffer[8];
-  pack_out[1] = pn532_packetbuffer[9];
+  // LEN counts TFI + resp_cmd + status + DATA, so DATA_LEN = LEN - 3.
+  // Reject mismatches so callers can rely on the size of resp_out.
+  if (len < 3 || (uint8_t)(len - 3) != resp_len) {
+    return false;
+  }
+
+  if (resp_len > 0 && resp_out != NULL) {
+    memcpy(resp_out, &pn532_packetbuffer[8], resp_len);
+  }
   return true;
+}
+
+/**************************************************************************/
+/*!
+    @brief   Performs a PWD_AUTH (0x1B) password authentication against a
+             Mifare Ultralight EV1 / NTAG21x tag.
+
+    Unlocks pages protected by the tag's AUTH0 / ACCESS configuration. The
+    2-byte PACK reply is returned through @p pack_out so the caller can
+    verify the tag's authenticity (mutual auth), not just the auth status.
+
+    @param   pwd       4-byte password matching the tag's PWD page.
+    @param   pack_out  2-byte buffer that receives the PACK on success.
+    @param   timeout   Command timeout in milliseconds.
+    @return  true on successful authentication, false on wrong password
+             or transport error.
+*/
+/**************************************************************************/
+bool Adafruit_PN532::mifareultralightev1_PwdAuth(const uint8_t pwd[4],
+                                                 uint8_t pack_out[2],
+                                                 uint16_t timeout) {
+  uint8_t cmd[5] = {MIFARE_ULTRALIGHTEV1_CMD_PWD_AUTH, pwd[0], pwd[1], pwd[2],
+                    pwd[3]};
+  return _ev1RawCommand(cmd, sizeof(cmd), pack_out, 2, timeout);
+}
+
+/**************************************************************************/
+/*!
+    @brief   Reads the 8-byte version block of a Mifare Ultralight EV1 /
+             NTAG21x tag (GET_VERSION, 0x60).
+
+    Lets the host distinguish EV1 sub-variants (MF0UL11 vs MF0UL21) and
+    NTAG213/215/216 from plain Ultralight or Ultralight C, by inspecting
+    vendor_id, product_type, product_subtype, major/minor version,
+    storage_size and protocol_type fields. Useful as a pre-flight check
+    before issuing EV1-only commands (PWD_AUTH, READ_SIG, READ_CNT, …),
+    since plain Ultralight returns a NAK on those and the difference is
+    only knowable from the version block.
+
+    @param   version   8-byte buffer that receives the version block.
+    @param   timeout   Command timeout in milliseconds.
+    @return  true on success, false otherwise.
+*/
+/**************************************************************************/
+bool Adafruit_PN532::mifareultralightev1_GetVersion(uint8_t version[8],
+                                                    uint16_t timeout) {
+  uint8_t cmd[1] = {MIFARE_ULTRALIGHTEV1_CMD_GET_VERSION};
+  return _ev1RawCommand(cmd, sizeof(cmd), version, 8, timeout);
+}
+
+/**************************************************************************/
+/*!
+    @brief   Reads the 32-byte ECC originality signature of a Mifare
+             Ultralight EV1 / NTAG21x tag (READ_SIG, 0x3C).
+
+    The signature is computed by NXP at manufacturing time over the tag's
+    UID with NXP's private key, and can be verified by the host against
+    the corresponding NXP public key to detect cloned/counterfeit tags.
+    READ_SIG itself does not authenticate the tag — it only provides the
+    material for an offline ECDSA verification step.
+
+    @param   signature  32-byte buffer that receives the signature.
+    @param   timeout    Command timeout in milliseconds.
+    @return  true on success, false otherwise.
+*/
+/**************************************************************************/
+bool Adafruit_PN532::mifareultralightev1_ReadSignature(uint8_t signature[32],
+                                                       uint16_t timeout) {
+  // 0x00 second byte is RFU per the NXP datasheet.
+  uint8_t cmd[2] = {MIFARE_ULTRALIGHTEV1_CMD_READ_SIG, 0x00};
+  return _ev1RawCommand(cmd, sizeof(cmd), signature, 32, timeout);
+}
+
+/**************************************************************************/
+/*!
+    @brief   Reads one of the three 24-bit one-way NFC counters of a
+             Mifare Ultralight EV1 / NTAG21x tag (READ_CNT, 0x39).
+
+    Counters can only be incremented, never decremented or cleared, which
+    makes them well-suited to anti-replay schemes: a host that recorded
+    counter value N can later reject any reading reporting a counter
+    value <= N as a replay.
+
+    @param   counter_num  Counter index (0..2 on EV1, 0 on NTAG21x).
+    @param   counter_out  3-byte buffer that receives the counter (LSB
+                          first).
+    @param   timeout      Command timeout in milliseconds.
+    @return  true on success, false otherwise.
+*/
+/**************************************************************************/
+bool Adafruit_PN532::mifareultralightev1_ReadCounter(uint8_t counter_num,
+                                                     uint8_t counter_out[3],
+                                                     uint16_t timeout) {
+  uint8_t cmd[2] = {MIFARE_ULTRALIGHTEV1_CMD_READ_CNT, counter_num};
+  return _ev1RawCommand(cmd, sizeof(cmd), counter_out, 3, timeout);
+}
+
+/**************************************************************************/
+/*!
+    @brief   Increments one of the three 24-bit one-way NFC counters of a
+             Mifare Ultralight EV1 / NTAG21x tag (INCR_CNT, 0xA5).
+
+    The tag adds @p increment to the selected counter, saturating at
+    0xFFFFFF. The operation is non-reversible. The 4th byte of the
+    on-the-wire payload is RFU per the NXP datasheet and is sent as
+    0x00 by this function.
+
+    @param   counter_num  Counter index (0..2 on EV1, 0 on NTAG21x).
+    @param   increment    3-byte 24-bit increment value, LSB first.
+    @param   timeout      Command timeout in milliseconds.
+    @return  true if the tag ACKed the increment, false otherwise.
+*/
+/**************************************************************************/
+bool Adafruit_PN532::mifareultralightev1_IncrementCounter(
+    uint8_t counter_num, const uint8_t increment[3], uint16_t timeout) {
+  uint8_t cmd[6] = {MIFARE_ULTRALIGHTEV1_CMD_INCR_CNT,
+                    counter_num,
+                    increment[0],
+                    increment[1],
+                    increment[2],
+                    0x00};
+  return _ev1RawCommand(cmd, sizeof(cmd), NULL, 0, timeout);
+}
+
+/**************************************************************************/
+/*!
+    @brief   Reads the tearing-event flag of a counter on a Mifare
+             Ultralight EV1 / NTAG21x tag (CHECK_TEARING_EVENT, 0x3E).
+
+    A "tearing event" occurs when the tag is removed from the field
+    while a counter increment is in progress, which can leave the
+    counter in an undefined state. The flag is set to 0xBD by the tag
+    while the counter is intact; any other value indicates a tearing
+    event was detected and the counter value should not be trusted.
+
+    @param   counter_num  Counter index (0..2 on EV1, 0 on NTAG21x).
+    @param   flag_out     1-byte buffer that receives the tearing flag
+                          (0xBD = no event, other = tearing observed).
+    @param   timeout      Command timeout in milliseconds.
+    @return  true on success, false otherwise.
+*/
+/**************************************************************************/
+bool Adafruit_PN532::mifareultralightev1_CheckTearingEvent(uint8_t counter_num,
+                                                           uint8_t *flag_out,
+                                                           uint16_t timeout) {
+  uint8_t cmd[2] = {MIFARE_ULTRALIGHTEV1_CMD_CHECK_TEARING_EVENT, counter_num};
+  return _ev1RawCommand(cmd, sizeof(cmd), flag_out, 1, timeout);
 }
 
 /***** NTAG2xx Functions ******/
